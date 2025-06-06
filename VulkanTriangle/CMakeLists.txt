@@ -1,7 +1,11 @@
 
 add_executable(VulkanTriangle
     main.cpp
-    VulkanDevice.cpp)
+    VulkanDevice.cpp
+    VulkanPipeline.cpp
+    VulkanRenderer.cpp
+    VulkanSwapchain.cpp
+    Window.cpp)
 
 find_package(Vulkan REQUIRED)
 
