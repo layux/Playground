@@ -5,7 +5,7 @@
 #include <spdlog/spdlog.h>
 #include <VkBootstrap.h>
 
-#include <algorithm> // Required for std::clamp
+#include <algorithm>
 #include <vulkan/vulkan.h>
 
 // Helper function to choose swap surface format
@@ -158,9 +158,11 @@ void DestroyVulkanSwapchain(VulkanSwapchain& swapchain, const VulkanDevice& devi
         vkDestroySwapchainKHR(device.logicalDevice, swapchain.swapchain, nullptr);
         swapchain.swapchain = VK_NULL_HANDLE;
     }
+
     if (swapchain.surface != VK_NULL_HANDLE) {
         vkDestroySurfaceKHR(device.instance, swapchain.surface, nullptr);
         swapchain.surface = VK_NULL_HANDLE;
     }
+
     spdlog::info("Vulkan swapchain destroyed successfully.");
 }

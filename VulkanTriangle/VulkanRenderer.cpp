@@ -11,14 +11,28 @@ void DestroySyncObjects(VulkanRenderer& renderer);
 
 bool CreateVulkanRenderer(VulkanRenderer& renderer, const Window& window) {
     if (!CreateVulkanDevice(renderer.device, window)) {
+        spdlog::error("Failed to create Vulkan device.");
         return false;
     }
 
     if (!CreateVulkanSwapchain(renderer.swapchain, renderer.device, window)) {
+        spdlog::error("Failed to create Vulkan swapchain.");
+        DestroyVulkanDevice(renderer.device);
         return false;
     }
 
     if (!CreateSyncObjects(renderer)) {
+        spdlog::error("Failed to create Vulkan synchronization objects.");
+        DestroyVulkanSwapchain(renderer.swapchain, renderer.device);
+        DestroyVulkanDevice(renderer.device);
+        return false;
+    }
+
+    if (!CreateCommandBuffers(renderer)) {
+        spdlog::error("Failed to create Vulkan command buffers.");
+        DestroySyncObjects(renderer);
+        DestroyVulkanSwapchain(renderer.swapchain, renderer.device);
+        DestroyVulkanDevice(renderer.device);
         return false;
     }
 
