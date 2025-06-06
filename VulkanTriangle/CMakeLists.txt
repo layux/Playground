@@ -1,11 +1,5 @@
 
-add_executable(VulkanTriangle
-    main.cpp
-    VulkanDevice.cpp
-    VulkanPipeline.cpp
-    VulkanRenderer.cpp
-    VulkanSwapchain.cpp
-    Window.cpp)
+add_executable(VulkanTriangle Sources/Entrypoint.cpp)
 
 find_package(Vulkan REQUIRED)
 
@@ -48,3 +42,12 @@ target_link_libraries(VulkanTriangle PRIVATE
     spdlog::spdlog
     vk-bootstrap
     Vulkan::Vulkan)
+
+if(WIN32)
+    target_compile_definitions(VulkanTriangle PRIVATE "UNICODE" "_UNICODE" "PLATFORM_WINDOWS")
+    #set_target_properties(VulkanTriangle PROPERTIES WIN32_EXECUTABLE TRUE)
+elseif(APPLE)
+    target_compile_definitions(VulkanTriangle PRIVATE "PLATFORM_DARWIN")
+else()
+    target_compile_definitions(VulkanTriangle PRIVATE "PLATFORM_LINUX")
+endif()
