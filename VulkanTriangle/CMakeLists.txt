@@ -1,5 +1,7 @@
 
-add_executable(VulkanTriangle main.cpp)
+add_executable(VulkanTriangle
+    main.cpp
+    VulkanDevice.cpp)
 
 find_package(Vulkan REQUIRED)
 
