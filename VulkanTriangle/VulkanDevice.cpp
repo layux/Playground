@@ -35,9 +35,7 @@ bool CreateVulkanDevice(VulkanDevice& device, const Window& window)
     vkb::PhysicalDeviceSelector physicalDeviceSelector(vkbInstance);
     auto physicalDeviceResult = physicalDeviceSelector
         .set_surface(surface)
-        .set_minimum_version(1, 1)
-        .require_dedicated_transfer_queue()
-        .prefer_gpu_device_type(vkb::PreferredDeviceType::discrete)
+        .set_minimum_version(1, 2)
         .select();
 
     if (!physicalDeviceResult) {
