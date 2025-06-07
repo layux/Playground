@@ -7,6 +7,8 @@
 
 #include <string>
 #include <vector>
+#include <fstream> // For readFile
+#include <glm/glm.hpp> // For Vertex struct
 
 /// Data structures
 struct Window
@@ -62,6 +64,31 @@ struct VulkanSynchronization
 	bool                     frameStarted      = false; // Indicates if a frame is currently being processed
 };
 
+// --- New Data Structures ---
+struct Vertex {
+    glm::vec3 pos;
+    glm::vec3 color;
+    // glm::vec2 texCoord; // Could be added later for texturing
+};
+
+struct VulkanMesh {
+    VkBuffer      vertexBuffer       = VK_NULL_HANDLE;
+    VmaAllocation vertexBufferMemory = VK_NULL_HANDLE;
+    uint32_t      vertexCount        = 0;
+    // VkBuffer      indexBuffer        = VK_NULL_HANDLE; // Optional for indexed drawing
+    // VmaAllocation indexBufferMemory  = VK_NULL_HANDLE;
+    // uint32_t      indexCount         = 0;
+};
+
+struct VulkanPipeline {
+    VkPipelineLayout pipelineLayout   = VK_NULL_HANDLE;
+    VkRenderPass     renderPass       = VK_NULL_HANDLE;
+    VkPipeline       graphicsPipeline = VK_NULL_HANDLE;
+    // VkShaderModule   vertShaderModule = VK_NULL_HANDLE; // Optional: if managed by pipeline
+    // VkShaderModule   fragShaderModule = VK_NULL_HANDLE; // Optional: if managed by pipeline
+};
+// --- End New Data Structures ---
+
 struct VulkanRenderer
 {
 	VulkanDevice                 device;         // Use composition instead of pointers
@@ -84,6 +111,54 @@ void destroyVulkanDevice(VulkanDevice& device);
 void destroyVulkanRenderer(VulkanRenderer& renderer);
 void destroyWindow(Window& window);
 
+// Utility Functions
+std::vector<char> readFile(const std::string& filename);
+VkShaderModule createShaderModule(VkDevice device, const std::vector<char>& code);
+VkVertexInputBindingDescription getVertexBindingDescription();
+std::vector<VkVertexInputAttributeDescription> getVertexAttributeDescriptions();
+
+// Mesh Lifecycle
+bool createVertexBuffer(VulkanMesh& mesh, VulkanDevice& device, VmaAllocator allocator, const std::vector<Vertex>& vertices);
+void destroyMesh(VulkanMesh& mesh, VulkanDevice& device, VmaAllocator allocator);
+
+// Pipeline Lifecycle
+bool createRenderPass(VkRenderPass& renderPass, VulkanDevice& device, VkFormat swapChainImageFormat);
+void destroyRenderPass(VkRenderPass& renderPass, VulkanDevice& device); // If render pass is managed separately
+
+bool createGraphicsPipeline(
+    VulkanPipeline& pipeline,
+    VulkanDevice& device,
+    VkExtent2D swapChainExtent,
+    VkRenderPass compatibleRenderPass,
+    const std::string& vertShaderPath,
+    const std::string& fragShaderPath
+);
+void destroyVulkanPipeline(VulkanPipeline& pipeline, VulkanDevice& device);
+
+// Framebuffer Lifecycle
+bool createFramebuffers(VulkanSwapChain& swapChain, VulkanDevice& device, VkRenderPass renderPass);
+void destroyFramebuffers(VulkanSwapChain& swapChain, VulkanDevice& device);
+
+// Command Pool & Buffer Management
+bool createCommandPool(VulkanRenderer& renderer);
+bool createCommandBuffers(VulkanRenderer& renderer); // Renamed from createPrimaryCommandBuffers for clarity
+
+// Drawing Operations
+bool drawFrame(
+    VulkanRenderer& renderer,
+    VulkanPipeline& activePipeline,
+    VulkanMesh& meshToDraw
+);
+
+void recordCommandBuffer(
+    VkCommandBuffer commandBuffer,
+    uint32_t imageIndex,
+    VulkanRenderer& renderer,
+    VulkanPipeline& activePipeline,
+    VulkanMesh& meshToDraw
+);
+// --- End New Function Declarations ---
+
 int main(int argc, char** argv)
 {
 	spdlog::set_level(spdlog::level::debug); // Set log level to debug
@@ -96,7 +171,6 @@ int main(int argc, char** argv)
 		destroyWindow(window);
 		return EXIT_FAILURE;
 	}
-
 	VulkanRenderer renderer;
 	if (!initVulkanRenderer(renderer, window))
 	{
@@ -105,17 +179,58 @@ int main(int argc, char** argv)
 		return EXIT_FAILURE;
 	}
 
+	// Create a basic render pass
+	VkRenderPass renderPass = VK_NULL_HANDLE;
+	if (!createRenderPass(renderPass, renderer.device, renderer.swapChain.imageFormat))
+	{
+		spdlog::critical("Failed to create render pass");
+		destroyVulkanRenderer(renderer);
+		destroyWindow(window);
+		return EXIT_FAILURE;
+	}
+	spdlog::info("Render pass created successfully");
+
+	// Create framebuffers for the swap chain
+	if (!createFramebuffers(renderer.swapChain, renderer.device, renderPass))
+	{
+		spdlog::critical("Failed to create framebuffers");
+		// Clean up created resources
+		destroyRenderPass(renderPass, renderer.device);
+		destroyVulkanRenderer(renderer);
+		destroyWindow(window);
+		return EXIT_FAILURE;
+	}
+	spdlog::info("Framebuffers created successfully");
+
+	// Create a simple pipeline for clearing the screen
+	VulkanPipeline pipeline;
+	pipeline.renderPass = renderPass;
+
 	spdlog::info("Application initialization complete");
+
+	// Empty mesh for now, since we're just clearing the screen
+	VulkanMesh emptyMesh;
+	emptyMesh.vertexCount = 0;
 
 	while (!glfwWindowShouldClose(window.handle))
 	{
 		glfwPollEvents();
-		// Render frame (not implemented in this snippet)
-		// ...
+		
+		// Draw a frame with our dark gray clear color
+		if (!drawFrame(renderer, pipeline, emptyMesh))
+		{
+			// Handle swap chain recreation or other errors
+			spdlog::warn("Failed to draw frame");
+		}
 	}
-
+	// Wait for the device to finish all operations before cleanup
+	vkDeviceWaitIdle(renderer.device.logicalDevice);
+	
 	spdlog::info("Attempting to terminate gracefully");
 
+	// Clean up resources in reverse order of creation
+	destroyFramebuffers(renderer.swapChain, renderer.device);
+	destroyRenderPass(renderPass, renderer.device);
 	destroyVulkanRenderer(renderer);
 	destroyWindow(window);
 	spdlog::info("Application terminated");
@@ -200,6 +315,27 @@ bool initVulkanRenderer(VulkanRenderer& renderer, const Window& window)
 		return false;
 	}
 	spdlog::info("Vulkan synchronization objects created successfully");
+	
+	// Create Command Pool
+	if (!createCommandPool(renderer))
+	{
+		spdlog::error("Failed to create Vulkan command pool");
+		destroySynchronization(renderer.synchronization, renderer.device);
+		destroySwapChain(renderer.swapChain, renderer.device);
+		return false;
+	}
+	spdlog::info("Command pool created successfully");
+
+	// Create Command Buffers
+	if (!createCommandBuffers(renderer))
+	{
+		spdlog::error("Failed to create Vulkan command buffers");
+		// Command pool will be destroyed by destroyVulkanRenderer
+		destroySynchronization(renderer.synchronization, renderer.device);
+		destroySwapChain(renderer.swapChain, renderer.device);
+		return false;
+	}
+	spdlog::info("Command buffers allocated successfully");
 	
 	return true;
 }
@@ -430,6 +566,14 @@ void destroyVulkanRenderer(VulkanRenderer& renderer)
 {
 	spdlog::debug("Destroying Vulkan renderer resources");
     // Destroy in reverse order of creation
+    
+    // Destroy command pool (this implicitly frees all allocated command buffers)
+    if (renderer.commandPool != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(renderer.device.logicalDevice, renderer.commandPool, nullptr);
+        renderer.commandPool = VK_NULL_HANDLE;
+        spdlog::debug("Command pool destroyed");
+    }
+    
     destroySynchronization(renderer.synchronization, renderer.device);
 	destroySwapChain(renderer.swapChain, renderer.device);
 	destroyVulkanDevice(renderer.device);
@@ -526,4 +670,558 @@ void destroySynchronization(VulkanSynchronization& sync, VulkanDevice& device)
     sync.imagesInFlight.clear(); // Does not own Vulkan objects, just clears the vector
 
     spdlog::debug("Synchronization primitives destroyed.");
+}
+
+// --- New Function Definitions ---
+// Utility Functions
+std::vector<char> readFile(const std::string& filename) {
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        spdlog::critical("Failed to open file: {}", filename);
+        return {};
+    }
+
+    size_t fileSize = static_cast<size_t>(file.tellg());
+    std::vector<char> buffer(fileSize);
+
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+
+    file.close();
+    spdlog::debug("Read {} bytes from file: {}", fileSize, filename);
+    return buffer;
+}
+
+VkShaderModule createShaderModule(VkDevice device, const std::vector<char>& code) {
+    VkShaderModuleCreateInfo createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    createInfo.codeSize = code.size();
+    createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+        spdlog::critical("Failed to create shader module");
+        return VK_NULL_HANDLE;
+    }
+
+    spdlog::debug("Shader module created successfully");
+    return shaderModule;
+}
+
+// Vertex Input Descriptions (Vulkan-specific for our Vertex struct)
+VkVertexInputBindingDescription getVertexBindingDescription() {
+    VkVertexInputBindingDescription bindingDescription{};
+    bindingDescription.binding = 0;
+    bindingDescription.stride = sizeof(Vertex);
+    bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    return bindingDescription;
+}
+
+std::vector<VkVertexInputAttributeDescription> getVertexAttributeDescriptions() {
+    return {
+        // Position attribute
+        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, pos) },
+        // Color attribute
+        { 0, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, color) },
+        // TexCoord attribute (if added in the future)
+        // { 0, 2, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, texCoord) },
+    };
+}
+
+// Mesh Lifecycle
+bool createVertexBuffer(VulkanMesh& mesh, VulkanDevice& device, VmaAllocator allocator, const std::vector<Vertex>& vertices) {
+    mesh.vertexCount = static_cast<uint32_t>(vertices.size());
+
+    // Create the vertex buffer
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = sizeof(Vertex) * mesh.vertexCount;
+    bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE; // Assuming single queue family for now
+
+    VmaAllocationCreateInfo allocInfo = {};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    allocInfo.requiredFlags = VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    if (vmaCreateBuffer(allocator, &bufferInfo, &allocInfo, &mesh.vertexBuffer, &mesh.vertexBufferMemory, nullptr) != VK_SUCCESS) {
+        spdlog::critical("Failed to create vertex buffer");
+        return false;
+    }
+
+    // Copy vertex data to the buffer
+    void* data;
+    if (vmaMapMemory(allocator, mesh.vertexBufferMemory, &data) != VK_SUCCESS) {
+        spdlog::critical("Failed to map vertex buffer memory");
+        return false;
+    }
+    memcpy(data, vertices.data(), sizeof(Vertex) * mesh.vertexCount);
+    vmaUnmapMemory(allocator, mesh.vertexBufferMemory);
+
+    spdlog::info("Vertex buffer created with {} vertices", mesh.vertexCount);
+    return true;
+}
+
+void destroyMesh(VulkanMesh& mesh, VulkanDevice& device, VmaAllocator allocator) {
+    if (mesh.vertexBuffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(allocator, mesh.vertexBuffer, mesh.vertexBufferMemory);
+        mesh.vertexBuffer = VK_NULL_HANDLE;
+        mesh.vertexBufferMemory = VK_NULL_HANDLE;
+        mesh.vertexCount = 0;
+        spdlog::debug("Vertex buffer destroyed");
+    }
+    // Add index buffer destruction here if implemented
+}
+
+// Pipeline Lifecycle
+bool createRenderPass(VkRenderPass& renderPass, VulkanDevice& device, VkFormat swapChainImageFormat) {
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = swapChainImageFormat;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkAttachmentReference colorAttachmentRef{};
+    colorAttachmentRef.attachment = 0;
+    colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorAttachmentRef;
+
+    VkRenderPassCreateInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &colorAttachment;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+
+    if (vkCreateRenderPass(device.logicalDevice, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS) {
+        spdlog::critical("Failed to create render pass");
+        return false;
+    }
+
+    spdlog::debug("Render pass created successfully");
+    return true;
+}
+
+void destroyRenderPass(VkRenderPass& renderPass, VulkanDevice& device) {
+    if (renderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(device.logicalDevice, renderPass, nullptr);
+        renderPass = VK_NULL_HANDLE;
+        spdlog::debug("Render pass destroyed");
+    }
+}
+
+bool createGraphicsPipeline(
+    VulkanPipeline& pipeline,
+    VulkanDevice& device,
+    VkExtent2D swapChainExtent,
+    VkRenderPass compatibleRenderPass,
+    const std::string& vertShaderPath,
+    const std::string& fragShaderPath
+) {
+    // Load and create shader modules
+    auto vertShaderCode = readFile(vertShaderPath);
+    auto fragShaderCode = readFile(fragShaderPath);
+
+    if (vertShaderCode.empty() || fragShaderCode.empty()) {
+        spdlog::critical("Failed to read shader files");
+        return false;
+    }
+
+    VkShaderModule vertShaderModule = createShaderModule(device.logicalDevice, vertShaderCode);
+    VkShaderModule fragShaderModule = createShaderModule(device.logicalDevice, fragShaderCode);
+
+    if (vertShaderModule == VK_NULL_HANDLE || fragShaderModule == VK_NULL_HANDLE) {
+        spdlog::critical("Failed to create shader modules");
+        return false;
+    }
+
+    // Pipeline layout (assuming no dynamic descriptors or push constants for now)
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 0; // No descriptor sets for now
+    pipelineLayoutInfo.pushConstantRangeCount = 0; // No push constants for now
+
+    if (vkCreatePipelineLayout(device.logicalDevice, &pipelineLayoutInfo, nullptr, &pipeline.pipelineLayout) != VK_SUCCESS) {
+        spdlog::critical("Failed to create pipeline layout");
+        return false;
+    }
+
+    // Render pass (assuming compatible with swap chain)
+    pipeline.renderPass = compatibleRenderPass;
+
+    // Graphics pipeline creation
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount = 2; // Vertex and fragment shaders
+    pipelineInfo.pStages = nullptr; // To be filled later
+
+    // Fixed function states (simplified)
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(swapChainExtent.width);
+    viewport.height = static_cast<float>(swapChainExtent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{};
+    scissor.offset = { 0, 0 };
+    scissor.extent = swapChainExtent;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.pViewports = &viewport;
+    viewportState.scissorCount = 1;
+    viewportState.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.depthClampEnable = VK_FALSE;
+    rasterizer.rasterizerDiscardEnable = VK_FALSE;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.depthBiasEnable = VK_FALSE;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.sampleShadingEnable = VK_FALSE;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.blendEnable = VK_FALSE;
+    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo colorBlending{};
+    colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAttachment;
+
+    // Assign shader stages to pipeline
+    VkPipelineShaderStageCreateInfo shaderStages[2] = {};
+
+    // Vertex shader stage
+    shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    shaderStages[0].module = vertShaderModule;
+    shaderStages[0].pName = "main";
+
+    // Fragment shader stage
+    shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    shaderStages[1].module = fragShaderModule;
+    shaderStages[1].pName = "main";
+
+    pipelineInfo.pStages = shaderStages;
+
+    // Input assembly state
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+
+    // Viewport and scissor state
+    pipelineInfo.pViewportState = &viewportState;
+
+    // Rasterization state
+    pipelineInfo.pRasterizationState = &rasterizer;
+
+    // Multisample state
+    pipelineInfo.pMultisampleState = &multisampling;
+
+    // Color blend state
+    pipelineInfo.pColorBlendState = &colorBlending;
+
+    // Pipeline layout and render pass
+    pipelineInfo.layout = pipeline.pipelineLayout;
+    pipelineInfo.renderPass = pipeline.renderPass;
+    pipelineInfo.subpass = 0; // Assuming single subpass
+
+    if (vkCreateGraphicsPipelines(device.logicalDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline.graphicsPipeline) != VK_SUCCESS) {
+        spdlog::critical("Failed to create graphics pipeline");
+        return false;
+    }
+
+    // Cleanup shader modules if not managed by the pipeline
+    vkDestroyShaderModule(device.logicalDevice, vertShaderModule, nullptr);
+    vkDestroyShaderModule(device.logicalDevice, fragShaderModule, nullptr);
+
+    spdlog::info("Graphics pipeline created successfully");
+    return true;
+}
+
+void destroyVulkanPipeline(VulkanPipeline& pipeline, VulkanDevice& device) {
+    if (pipeline.graphicsPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device.logicalDevice, pipeline.graphicsPipeline, nullptr);
+        pipeline.graphicsPipeline = VK_NULL_HANDLE;
+        spdlog::debug("Graphics pipeline destroyed");
+    }
+    if (pipeline.pipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device.logicalDevice, pipeline.pipelineLayout, nullptr);
+        pipeline.pipelineLayout = VK_NULL_HANDLE;
+        spdlog::debug("Pipeline layout destroyed");
+    }
+    // Render pass destruction is now managed separately
+}
+
+// Framebuffer Lifecycle
+bool createFramebuffers(VulkanSwapChain& swapChain, VulkanDevice& device, VkRenderPass renderPass) {
+    swapChain.framebuffers.resize(swapChain.imageViews.size());
+
+    for (size_t i = 0; i < swapChain.imageViews.size(); i++) {
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = renderPass;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = &swapChain.imageViews[i];
+        framebufferInfo.width = swapChain.extent.width;
+        framebufferInfo.height = swapChain.extent.height;
+        framebufferInfo.layers = 1;
+
+        if (vkCreateFramebuffer(device.logicalDevice, &framebufferInfo, nullptr, &swapChain.framebuffers[i]) != VK_SUCCESS) {
+            spdlog::critical("Failed to create framebuffer for swap chain image view {}", i);
+            return false;
+        }
+    }
+
+    spdlog::info("Framebuffers created successfully");
+    return true;
+}
+
+void destroyFramebuffers(VulkanSwapChain& swapChain, VulkanDevice& device) {
+    for (auto framebuffer : swapChain.framebuffers) {
+        if (framebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(device.logicalDevice, framebuffer, nullptr);
+        }
+    }
+    swapChain.framebuffers.clear();
+    spdlog::debug("Framebuffers destroyed");
+}
+
+// Command Pool & Buffer Management
+bool createCommandPool(VulkanRenderer& renderer) {
+    // Create a command pool for the graphics queue
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.queueFamilyIndex = renderer.device.graphicsQueueFamilyIndex;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; // Allow command buffer to be reset
+
+    if (vkCreateCommandPool(renderer.device.logicalDevice, &poolInfo, nullptr, &renderer.commandPool) != VK_SUCCESS) {
+        spdlog::critical("Failed to create command pool");
+        return false;
+    }
+
+    spdlog::debug("Command pool created successfully");
+    return true;
+}
+
+bool createCommandBuffers(VulkanRenderer& renderer) {
+    // Allocate command buffers from the command pool
+    renderer.commandBuffers.resize(renderer.synchronization.maxFramesInFlight);
+
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = renderer.commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = static_cast<uint32_t>(renderer.commandBuffers.size());
+
+    if (vkAllocateCommandBuffers(renderer.device.logicalDevice, &allocInfo, renderer.commandBuffers.data()) != VK_SUCCESS) {
+        spdlog::critical("Failed to allocate command buffers");
+        return false;
+    }
+
+    spdlog::debug("Command buffers allocated successfully");
+    return true;
+}
+
+// Drawing Operations
+bool drawFrame(
+    VulkanRenderer& renderer,
+    VulkanPipeline& activePipeline,
+    VulkanMesh& meshToDraw
+) {
+    // Wait for the previous frame to complete
+    vkWaitForFences(renderer.device.logicalDevice, 1, &renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame], VK_TRUE, UINT64_MAX);
+
+    // Get the index of the next image to render to
+    uint32_t imageIndex;
+    VkResult result = vkAcquireNextImageKHR(renderer.device.logicalDevice, renderer.swapChain.handle, UINT64_MAX,
+                                           renderer.synchronization.imageAvailableSemaphores[renderer.synchronization.currentFrame],
+                                           VK_NULL_HANDLE, &imageIndex);
+    
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        spdlog::warn("Swap chain out of date, recreate swap chain");
+        // Handle swap chain recreation (signal a flag, call recreateSwapChain, etc.)
+        return false;
+    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        spdlog::critical("Failed to acquire swap chain image");
+        return false;
+    }
+
+    // Check if a previous frame is using this image (i.e. there is its fence to wait on)
+    if (renderer.synchronization.imagesInFlight[imageIndex] != VK_NULL_HANDLE) {
+        vkWaitForFences(renderer.device.logicalDevice, 1, &renderer.synchronization.imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX);
+    }
+    // Mark the image as now being in use by this frame
+    renderer.synchronization.imagesInFlight[imageIndex] = renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame];
+
+    // Reset the fence for the current frame
+    vkResetFences(renderer.device.logicalDevice, 1, &renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame]);
+
+    // Reset the command buffer for this frame
+    vkResetCommandBuffer(renderer.commandBuffers[renderer.synchronization.currentFrame], 0);
+
+    // Record commands for this frame
+    recordCommandBuffer(renderer.commandBuffers[renderer.synchronization.currentFrame], imageIndex, renderer, activePipeline, meshToDraw);    // Submit the command buffer for execution
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    
+    // Wait for the imageAvailable semaphore
+    VkSemaphore waitSemaphores[] = {renderer.synchronization.imageAvailableSemaphores[renderer.synchronization.currentFrame]};
+    VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    
+    // Command buffer to submit
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &renderer.commandBuffers[renderer.synchronization.currentFrame];
+    
+    // Semaphore to signal when the command buffer has finished execution
+    VkSemaphore signalSemaphores[] = {renderer.synchronization.renderFinishedSemaphores[renderer.synchronization.currentFrame]};
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+    
+    // Submit the command buffer
+    if (vkQueueSubmit(renderer.device.graphicsQueue, 1, &submitInfo, 
+                     renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame]) != VK_SUCCESS) {
+        spdlog::critical("Failed to submit draw command buffer");
+        return false;
+    }
+
+    // Submit the queue
+    if (vkQueueSubmit(renderer.device.graphicsQueue, 1, &submitInfo, renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame]) != VK_SUCCESS) {
+        spdlog::critical("Failed to submit draw command buffer");
+        return false;
+    }
+
+    // Present the image
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = &renderer.synchronization.renderFinishedSemaphores[renderer.synchronization.currentFrame];
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &renderer.swapChain.handle;
+    presentInfo.pImageIndices = &imageIndex;
+
+    result = vkQueuePresentKHR(renderer.device.presentQueue, &presentInfo);
+	
+	if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        spdlog::warn("Swap chain out of date or suboptimal, recreate swap chain");
+        // Handle swap chain recreation
+        return false;
+    } else if (result != VK_SUCCESS) {
+        spdlog::critical("Failed to present swap chain image");
+        return false;
+    }
+
+    // Move to the next frame
+    renderer.synchronization.currentFrame = (renderer.synchronization.currentFrame + 1) % renderer.synchronization.maxFramesInFlight;
+
+    return true;
+}
+
+void recordCommandBuffer(
+    VkCommandBuffer commandBuffer,
+    uint32_t imageIndex,
+    VulkanRenderer& renderer,
+    VulkanPipeline& activePipeline,
+    VulkanMesh& meshToDraw
+) {
+    // Begin command buffer recording
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = 0; // Optional: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        spdlog::critical("Failed to begin recording command buffer");
+        return;
+    }
+
+    // Specify the rendering area
+    VkRenderPassBeginInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    renderPassInfo.renderPass = activePipeline.renderPass;
+    renderPassInfo.framebuffer = renderer.swapChain.framebuffers[imageIndex];
+    renderPassInfo.renderArea.offset = {0, 0};
+    renderPassInfo.renderArea.extent = renderer.swapChain.extent;
+      // Set clear color to dark gray (RGBA in normalized floats: 0.2, 0.2, 0.2, 1.0)
+    VkClearValue clearColor = {{{0.2f, 0.2f, 0.2f, 1.0f}}};
+    renderPassInfo.clearValueCount = 1;
+    renderPassInfo.pClearValues = &clearColor;
+    
+    // Begin render pass
+    vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+    
+    // For now, we'll just clear the screen and not draw anything
+    // In the future, bind pipeline, draw mesh, etc:
+    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline.graphicsPipeline);
+    // VkBuffer vertexBuffers[] = {meshToDraw.vertexBuffer};
+    // VkDeviceSize offsets[] = {0};
+    // vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+    // vkCmdDraw(commandBuffer, meshToDraw.vertexCount, 1, 0, 0);
+    
+    // End render pass
+    vkCmdEndRenderPass(commandBuffer);
+    
+    // End command buffer recording
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        spdlog::critical("Failed to record command buffer");
+    }
+    renderPassInfo.renderArea.offset = { 0, 0 };
+    renderPassInfo.renderArea.extent = renderer.swapChain.extent;
+
+    // Clear values for color and depth (if used)
+    VkClearValue clearColor = { {0.0f, 0.0f, 0.0f, 1.0f} };
+    VkClearValue clearDepth = { 1.0f, 0 };
+    VkClearValue clearValues[] = { clearColor, clearDepth };
+
+    renderPassInfo.clearValueCount = 2;
+    renderPassInfo.pClearValues = clearValues;
+
+    // Begin the render pass
+    vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Bind the graphics pipeline
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline.graphicsPipeline);
+
+    // Bind the vertex buffer
+    VkBuffer vertexBuffers[] = { meshToDraw.vertexBuffer };
+    VkDeviceSize offsets[] = { 0 };
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+
+    // Draw the mesh
+    vkCmdDraw(commandBuffer, meshToDraw.vertexCount, 1, 0, 0);
+
+    // End the render pass
+    vkCmdEndRenderPass(commandBuffer);
+
+    // End command buffer recording
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        spdlog::critical("Failed to end recording command buffer");
+        return;
+    }
+
+    spdlog::debug("Command buffer recorded successfully for image index {}", imageIndex);
 }
