@@ -76,7 +76,9 @@ bool initWindow(Window& window);
 bool initVulkanRenderer(VulkanRenderer& renderer, const Window& window);
 bool createVulkanDevice(VulkanDevice& device, const Window& window);
 bool createSwapChain(VulkanSwapChain& swapChain, VulkanDevice& device, const Window& window);
+bool createSynchronization(VulkanSynchronization& sync, VulkanDevice& device, const VulkanSwapChain& swapChain); // Added
 
+void destroySynchronization(VulkanSynchronization& sync, VulkanDevice& device); // Added
 void destroySwapChain(VulkanSwapChain& swapChain, VulkanDevice& device);
 void destroyVulkanDevice(VulkanDevice& device);
 void destroyVulkanRenderer(VulkanRenderer& renderer);
@@ -178,11 +180,26 @@ bool initVulkanRenderer(VulkanRenderer& renderer, const Window& window)
 		spdlog::error("Failed to create Vulkan device");
 		return false;
 	}
-
 	spdlog::info("Vulkan device created successfully");
-	
-	// NOTE: SwapChain and Synchronization initialization would go here
-	// but we're not implementing that yet as per requirements
+
+	// Create SwapChain
+	if (!createSwapChain(renderer.swapChain, renderer.device, window))
+	{
+		spdlog::error("Failed to create Vulkan swap chain");
+		// No need to explicitly call destroyVulkanDevice here, 
+		// as the caller of initVulkanRenderer will handle it if this function returns false.
+		return false;
+	}
+	spdlog::info("Vulkan swap chain created successfully");
+
+	// Create Synchronization objects
+	if (!createSynchronization(renderer.synchronization, renderer.device, renderer.swapChain))
+	{
+		spdlog::error("Failed to create Vulkan synchronization objects");
+		destroySwapChain(renderer.swapChain, renderer.device); // Clean up created swapchain
+		return false;
+	}
+	spdlog::info("Vulkan synchronization objects created successfully");
 	
 	return true;
 }
@@ -348,11 +365,75 @@ bool createSwapChain(VulkanSwapChain& swapChain, VulkanDevice& device, const Win
     return true;
 }
 
+bool createSynchronization(VulkanSynchronization& sync, VulkanDevice& device, const VulkanSwapChain& swapChain)
+{
+    sync.imageAvailableSemaphores.assign(sync.maxFramesInFlight, VK_NULL_HANDLE);
+    sync.renderFinishedSemaphores.assign(sync.maxFramesInFlight, VK_NULL_HANDLE);
+    sync.inFlightFences.assign(sync.maxFramesInFlight, VK_NULL_HANDLE);
+    
+    // imagesInFlight should be sized based on the number of swap chain images
+    // It stores VK_NULL_HANDLE or a pointer to one of the inFlightFences
+    sync.imagesInFlight.assign(swapChain.images.size(), VK_NULL_HANDLE);
+
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // Create fences in signaled state for the first frame
+
+    bool success = true;
+    for (uint32_t i = 0; i < sync.maxFramesInFlight; ++i)
+    {
+        if (vkCreateSemaphore(device.logicalDevice, &semaphoreInfo, nullptr, &sync.imageAvailableSemaphores[i]) != VK_SUCCESS) {
+            spdlog::critical("Failed to create imageAvailableSemaphore #{}", i);
+            success = false; break;
+        }
+        if (vkCreateSemaphore(device.logicalDevice, &semaphoreInfo, nullptr, &sync.renderFinishedSemaphores[i]) != VK_SUCCESS) {
+            spdlog::critical("Failed to create renderFinishedSemaphore #{}", i);
+            success = false; break;
+        }
+        if (vkCreateFence(device.logicalDevice, &fenceInfo, nullptr, &sync.inFlightFences[i]) != VK_SUCCESS) {
+            spdlog::critical("Failed to create inFlightFence #{}", i);
+            success = false; break;
+        }
+    }
+
+    if (!success) {
+        spdlog::critical("Failed to create all synchronization objects. Cleaning up partially created ones.");
+        // Cleanup all potentially created sync objects by this call
+        // This relies on destroySynchronization being able to handle partially filled/VK_NULL_HANDLE vectors
+        // For a more direct cleanup here:
+        for (uint32_t i = 0; i < sync.maxFramesInFlight; ++i) { // Iterate up to maxFramesInFlight as assign was used
+            if (sync.imageAvailableSemaphores[i] != VK_NULL_HANDLE) {
+                vkDestroySemaphore(device.logicalDevice, sync.imageAvailableSemaphores[i], nullptr);
+            }
+            if (sync.renderFinishedSemaphores[i] != VK_NULL_HANDLE) {
+                vkDestroySemaphore(device.logicalDevice, sync.renderFinishedSemaphores[i], nullptr);
+            }
+            if (sync.inFlightFences[i] != VK_NULL_HANDLE) {
+                vkDestroyFence(device.logicalDevice, sync.inFlightFences[i], nullptr);
+            }
+        }
+        sync.imageAvailableSemaphores.clear();
+        sync.renderFinishedSemaphores.clear();
+        sync.inFlightFences.clear();
+        sync.imagesInFlight.clear();
+        return false;
+    }
+
+    spdlog::info("Synchronization primitives created successfully ({} frames in flight).", sync.maxFramesInFlight);
+    return true;
+}
+
 void destroyVulkanRenderer(VulkanRenderer& renderer)
 {
-	spdlog::debug("Destroying Vulkan device and associated resources");
+	spdlog::debug("Destroying Vulkan renderer resources");
+    // Destroy in reverse order of creation
+    destroySynchronization(renderer.synchronization, renderer.device);
 	destroySwapChain(renderer.swapChain, renderer.device);
 	destroyVulkanDevice(renderer.device);
+    spdlog::info("Vulkan renderer resources destroyed.");
 }
 
 void destroyVulkanDevice(VulkanDevice& device)
@@ -416,4 +497,33 @@ void destroySwapChain(VulkanSwapChain& swapChain, VulkanDevice& device)
 	swapChain.extent = {};
 
 	spdlog::debug("Swap chain destroyed");
+}
+
+void destroySynchronization(VulkanSynchronization& sync, VulkanDevice& device)
+{
+    spdlog::debug("Destroying synchronization primitives...");
+    for (VkSemaphore semaphore : sync.imageAvailableSemaphores) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device.logicalDevice, semaphore, nullptr);
+        }
+    }
+    sync.imageAvailableSemaphores.clear();
+
+    for (VkSemaphore semaphore : sync.renderFinishedSemaphores) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device.logicalDevice, semaphore, nullptr);
+        }
+    }
+    sync.renderFinishedSemaphores.clear();
+
+    for (VkFence fence : sync.inFlightFences) {
+        if (fence != VK_NULL_HANDLE) {
+            vkDestroyFence(device.logicalDevice, fence, nullptr);
+        }
+    }
+    sync.inFlightFences.clear();
+    
+    sync.imagesInFlight.clear(); // Does not own Vulkan objects, just clears the vector
+
+    spdlog::debug("Synchronization primitives destroyed.");
 }
