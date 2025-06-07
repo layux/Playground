@@ -1,0 +1,1 @@
+#include "MiniEngine/Graphics/VulkanSynchronization.hpp"
