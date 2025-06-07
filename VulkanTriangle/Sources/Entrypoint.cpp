@@ -53,11 +53,13 @@ struct VulkanSwapChain
 
 struct VulkanSynchronization
 {
-	// Semaphores for image acquisition and presentation
+	// Semaphores for image acquisition and presentation - one pair per swap chain image
 	std::vector<VkSemaphore> imageAvailableSemaphores;
 	std::vector<VkSemaphore> renderFinishedSemaphores;
-	// Fences for frame synchronization
+	// Fences for frame synchronization - one per frame in flight
 	std::vector<VkFence>     inFlightFences;
+	// Track which fence is associated with each swap chain image
+	// This prevents rendering to images that are still in flight
 	std::vector<VkFence>     imagesInFlight;
 	uint32_t                 currentFrame      = 0;     // Index of the current frame
 	uint32_t                 maxFramesInFlight = 2;     // Double buffering
@@ -201,23 +203,58 @@ int main(int argc, char** argv)
 		return EXIT_FAILURE;
 	}
 	spdlog::info("Framebuffers created successfully");
-
-	// Create a simple pipeline for clearing the screen
+	// Create a graphics pipeline for our triangle
 	VulkanPipeline pipeline;
 	pipeline.renderPass = renderPass;
+	
+	// Compile shaders if needed
+	// Note: In production, this would be part of your build process
+	system("compile_shaders.bat");
+	
+	// Create the graphics pipeline with our vertex and fragment shaders
+	if (!createGraphicsPipeline(
+	    pipeline,
+	    renderer.device,
+	    renderer.swapChain.extent,
+	    renderPass,
+	    "Resources/Shaders/spirv/Triangle.vert.spv",
+	    "Resources/Shaders/spirv/Triangle.frag.spv"
+	)) {
+	    spdlog::critical("Failed to create graphics pipeline");
+	    destroyFramebuffers(renderer.swapChain, renderer.device);
+	    destroyRenderPass(renderPass, renderer.device);
+	    destroyVulkanRenderer(renderer);
+	    destroyWindow(window);
+	    return EXIT_FAILURE;
+	}
+	spdlog::info("Graphics pipeline created successfully");
+
+	// Create a triangle mesh
+	// For this shader, we'll use a hardcoded triangle in the shader itself
+	// (see Triangle.vert), so we just need a dummy mesh with 3 vertices
+	VulkanMesh triangleMesh;
+	std::vector<Vertex> vertices(3);
+	
+	// The actual vertex data will be defined in the shader
+	// We just need to create a buffer with the correct number of vertices
+	if (!createVertexBuffer(triangleMesh, renderer.device, renderer.device.allocator, vertices)) {
+	    spdlog::critical("Failed to create vertex buffer");
+	    destroyVulkanPipeline(pipeline, renderer.device);
+	    destroyFramebuffers(renderer.swapChain, renderer.device);
+	    destroyRenderPass(renderPass, renderer.device);
+	    destroyVulkanRenderer(renderer);
+	    destroyWindow(window);
+	    return EXIT_FAILURE;
+	}
+	spdlog::info("Triangle mesh created successfully with {} vertices", triangleMesh.vertexCount);
 
 	spdlog::info("Application initialization complete");
-
-	// Empty mesh for now, since we're just clearing the screen
-	VulkanMesh emptyMesh;
-	emptyMesh.vertexCount = 0;
 
 	while (!glfwWindowShouldClose(window.handle))
 	{
 		glfwPollEvents();
-		
-		// Draw a frame with our dark gray clear color
-		if (!drawFrame(renderer, pipeline, emptyMesh))
+				// Draw a frame with our triangle
+		if (!drawFrame(renderer, pipeline, triangleMesh))
 		{
 			// Handle swap chain recreation or other errors
 			spdlog::warn("Failed to draw frame");
@@ -227,8 +264,9 @@ int main(int argc, char** argv)
 	vkDeviceWaitIdle(renderer.device.logicalDevice);
 	
 	spdlog::info("Attempting to terminate gracefully");
-
 	// Clean up resources in reverse order of creation
+	destroyMesh(triangleMesh, renderer.device, renderer.device.allocator);
+	destroyVulkanPipeline(pipeline, renderer.device);
 	destroyFramebuffers(renderer.swapChain, renderer.device);
 	destroyRenderPass(renderPass, renderer.device);
 	destroyVulkanRenderer(renderer);
@@ -410,14 +448,13 @@ bool createVulkanDevice(VulkanDevice& device, const Window& window)
 
 	spdlog::debug("Graphics queue family index: {}, Present queue family index: {}",
 		device.graphicsQueueFamilyIndex, device.presentQueueFamilyIndex);
-
 	// Create VMA allocator
 	VmaAllocatorCreateInfo allocatorInfo = {};
 	allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_2; // Use Vulkan 1.2 API
 	allocatorInfo.physicalDevice = device.physicalDevice;
 	allocatorInfo.device = device.logicalDevice;
 	allocatorInfo.instance = device.instance;
-	allocatorInfo.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT; // Enable buffer device address
+	// Remove VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT flag since bufferDeviceAddress feature is not enabled
 
 	if (vmaCreateAllocator(&allocatorInfo, &device.allocator) != VK_SUCCESS)
 	{
@@ -503,13 +540,17 @@ bool createSwapChain(VulkanSwapChain& swapChain, VulkanDevice& device, const Win
 
 bool createSynchronization(VulkanSynchronization& sync, VulkanDevice& device, const VulkanSwapChain& swapChain)
 {
-    sync.imageAvailableSemaphores.assign(sync.maxFramesInFlight, VK_NULL_HANDLE);
-    sync.renderFinishedSemaphores.assign(sync.maxFramesInFlight, VK_NULL_HANDLE);
+    // Create semaphores per swap chain image (not per frame in flight)
+    uint32_t imageCount = static_cast<uint32_t>(swapChain.images.size());
+    sync.imageAvailableSemaphores.assign(imageCount, VK_NULL_HANDLE);
+    sync.renderFinishedSemaphores.assign(imageCount, VK_NULL_HANDLE);
+    
+    // We still maintain one fence per frame in flight for CPU-GPU synchronization
     sync.inFlightFences.assign(sync.maxFramesInFlight, VK_NULL_HANDLE);
     
-    // imagesInFlight should be sized based on the number of swap chain images
+    // imagesInFlight still sized based on the number of swap chain images
     // It stores VK_NULL_HANDLE or a pointer to one of the inFlightFences
-    sync.imagesInFlight.assign(swapChain.images.size(), VK_NULL_HANDLE);
+    sync.imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
 
     VkSemaphoreCreateInfo semaphoreInfo{};
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -519,7 +560,9 @@ bool createSynchronization(VulkanSynchronization& sync, VulkanDevice& device, co
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // Create fences in signaled state for the first frame
 
     bool success = true;
-    for (uint32_t i = 0; i < sync.maxFramesInFlight; ++i)
+    
+    // Create semaphores for each swap chain image
+    for (uint32_t i = 0; i < imageCount; ++i)
     {
         if (vkCreateSemaphore(device.logicalDevice, &semaphoreInfo, nullptr, &sync.imageAvailableSemaphores[i]) != VK_SUCCESS) {
             spdlog::critical("Failed to create imageAvailableSemaphore #{}", i);
@@ -529,28 +572,37 @@ bool createSynchronization(VulkanSynchronization& sync, VulkanDevice& device, co
             spdlog::critical("Failed to create renderFinishedSemaphore #{}", i);
             success = false; break;
         }
+    }
+    
+    // Create fences for each frame in flight
+    for (uint32_t i = 0; i < sync.maxFramesInFlight && success; ++i)
+    {
         if (vkCreateFence(device.logicalDevice, &fenceInfo, nullptr, &sync.inFlightFences[i]) != VK_SUCCESS) {
             spdlog::critical("Failed to create inFlightFence #{}", i);
             success = false; break;
         }
-    }
-
-    if (!success) {
+    }    if (!success) {
         spdlog::critical("Failed to create all synchronization objects. Cleaning up partially created ones.");
         // Cleanup all potentially created sync objects by this call
-        // This relies on destroySynchronization being able to handle partially filled/VK_NULL_HANDLE vectors
-        // For a more direct cleanup here:
-        for (uint32_t i = 0; i < sync.maxFramesInFlight; ++i) { // Iterate up to maxFramesInFlight as assign was used
+        
+        // Clean up semaphores (per swap chain image)
+        for (uint32_t i = 0; i < sync.imageAvailableSemaphores.size(); ++i) {
             if (sync.imageAvailableSemaphores[i] != VK_NULL_HANDLE) {
                 vkDestroySemaphore(device.logicalDevice, sync.imageAvailableSemaphores[i], nullptr);
             }
-            if (sync.renderFinishedSemaphores[i] != VK_NULL_HANDLE) {
+            if (i < sync.renderFinishedSemaphores.size() && sync.renderFinishedSemaphores[i] != VK_NULL_HANDLE) {
                 vkDestroySemaphore(device.logicalDevice, sync.renderFinishedSemaphores[i], nullptr);
             }
+        }
+        
+        // Clean up fences (per frame in flight)
+        for (uint32_t i = 0; i < sync.inFlightFences.size(); ++i) {
             if (sync.inFlightFences[i] != VK_NULL_HANDLE) {
                 vkDestroyFence(device.logicalDevice, sync.inFlightFences[i], nullptr);
             }
         }
+        
+        // Clear all vectors
         sync.imageAvailableSemaphores.clear();
         sync.renderFinishedSemaphores.clear();
         sync.inFlightFences.clear();
@@ -646,6 +698,7 @@ void destroySwapChain(VulkanSwapChain& swapChain, VulkanDevice& device)
 void destroySynchronization(VulkanSynchronization& sync, VulkanDevice& device)
 {
     spdlog::debug("Destroying synchronization primitives...");
+    // Destroy image-specific semaphores
     for (VkSemaphore semaphore : sync.imageAvailableSemaphores) {
         if (semaphore != VK_NULL_HANDLE) {
             vkDestroySemaphore(device.logicalDevice, semaphore, nullptr);
@@ -660,6 +713,7 @@ void destroySynchronization(VulkanSynchronization& sync, VulkanDevice& device)
     }
     sync.renderFinishedSemaphores.clear();
 
+    // Destroy frame-specific fences
     for (VkFence fence : sync.inFlightFences) {
         if (fence != VK_NULL_HANDLE) {
             vkDestroyFence(device.logicalDevice, fence, nullptr);
@@ -730,9 +784,7 @@ std::vector<VkVertexInputAttributeDescription> getVertexAttributeDescriptions() 
 
 // Mesh Lifecycle
 bool createVertexBuffer(VulkanMesh& mesh, VulkanDevice& device, VmaAllocator allocator, const std::vector<Vertex>& vertices) {
-    mesh.vertexCount = static_cast<uint32_t>(vertices.size());
-
-    // Create the vertex buffer
+    mesh.vertexCount = static_cast<uint32_t>(vertices.size());    // Create the vertex buffer
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = sizeof(Vertex) * mesh.vertexCount;
@@ -740,8 +792,8 @@ bool createVertexBuffer(VulkanMesh& mesh, VulkanDevice& device, VmaAllocator all
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE; // Assuming single queue family for now
 
     VmaAllocationCreateInfo allocInfo = {};
-    allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
-    allocInfo.requiredFlags = VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU; // Host visible memory for mapping
+    // Don't set the requiredFlags to allow VMA to choose appropriate memory type
 
     if (vmaCreateBuffer(allocator, &bufferInfo, &allocInfo, &mesh.vertexBuffer, &mesh.vertexBufferMemory, nullptr) != VK_SUCCESS) {
         spdlog::critical("Failed to create vertex buffer");
@@ -926,7 +978,16 @@ bool createGraphicsPipeline(
     shaderStages[1].module = fragShaderModule;
     shaderStages[1].pName = "main";
 
-    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pStages = shaderStages;    // Vertex input state
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
+    vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    
+    // For our shader which uses gl_VertexIndex, we don't need any vertex input bindings
+    // If we were using an actual vertex buffer with data, we would fill these in
+    vertexInputInfo.vertexBindingDescriptionCount = 0;
+    vertexInputInfo.vertexAttributeDescriptionCount = 0;
+    
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
 
     // Input assembly state
     pipelineInfo.pInputAssemblyState = &inputAssembly;
@@ -1052,12 +1113,12 @@ bool drawFrame(
     VulkanMesh& meshToDraw
 ) {
     // Wait for the previous frame to complete
-    vkWaitForFences(renderer.device.logicalDevice, 1, &renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame], VK_TRUE, UINT64_MAX);
-
-    // Get the index of the next image to render to
+    vkWaitForFences(renderer.device.logicalDevice, 1, &renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame], VK_TRUE, UINT64_MAX);    // Get the index of the next image to render to
     uint32_t imageIndex;
+    // Since we have one semaphore per swap chain image, we can always use semaphore 0 to acquire the next image
+    // After acquisition, we'll use the semaphore corresponding to the acquired image index
     VkResult result = vkAcquireNextImageKHR(renderer.device.logicalDevice, renderer.swapChain.handle, UINT64_MAX,
-                                           renderer.synchronization.imageAvailableSemaphores[renderer.synchronization.currentFrame],
+                                           renderer.synchronization.imageAvailableSemaphores[0],
                                            VK_NULL_HANDLE, &imageIndex);
     
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -1085,10 +1146,8 @@ bool drawFrame(
     // Record commands for this frame
     recordCommandBuffer(renderer.commandBuffers[renderer.synchronization.currentFrame], imageIndex, renderer, activePipeline, meshToDraw);    // Submit the command buffer for execution
     VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    
-    // Wait for the imageAvailable semaphore
-    VkSemaphore waitSemaphores[] = {renderer.synchronization.imageAvailableSemaphores[renderer.synchronization.currentFrame]};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;    // Wait for the imageAvailable semaphore that we used to acquire the image (always semaphore 0)
+    VkSemaphore waitSemaphores[] = {renderer.synchronization.imageAvailableSemaphores[0]};
     VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
     submitInfo.waitSemaphoreCount = 1;
     submitInfo.pWaitSemaphores = waitSemaphores;
@@ -1096,31 +1155,21 @@ bool drawFrame(
     
     // Command buffer to submit
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &renderer.commandBuffers[renderer.synchronization.currentFrame];
-    
-    // Semaphore to signal when the command buffer has finished execution
-    VkSemaphore signalSemaphores[] = {renderer.synchronization.renderFinishedSemaphores[renderer.synchronization.currentFrame]};
+    submitInfo.pCommandBuffers = &renderer.commandBuffers[renderer.synchronization.currentFrame];    // Signal the renderFinished semaphore for the specific image
+    VkSemaphore signalSemaphores[] = {renderer.synchronization.renderFinishedSemaphores[imageIndex]};
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = signalSemaphores;
-    
-    // Submit the command buffer
+      // Submit the command buffer
     if (vkQueueSubmit(renderer.device.graphicsQueue, 1, &submitInfo, 
                      renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame]) != VK_SUCCESS) {
         spdlog::critical("Failed to submit draw command buffer");
         return false;
     }
 
-    // Submit the queue
-    if (vkQueueSubmit(renderer.device.graphicsQueue, 1, &submitInfo, renderer.synchronization.inFlightFences[renderer.synchronization.currentFrame]) != VK_SUCCESS) {
-        spdlog::critical("Failed to submit draw command buffer");
-        return false;
-    }
-
     // Present the image
     VkPresentInfoKHR presentInfo{};
-    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores = &renderer.synchronization.renderFinishedSemaphores[renderer.synchronization.currentFrame];
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = &renderer.synchronization.renderFinishedSemaphores[imageIndex];
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &renderer.swapChain.handle;
     presentInfo.pImageIndices = &imageIndex;
@@ -1159,67 +1208,39 @@ void recordCommandBuffer(
         return;
     }
 
-    // Specify the rendering area
+    // Begin render pass
     VkRenderPassBeginInfo renderPassInfo{};
     renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     renderPassInfo.renderPass = activePipeline.renderPass;
     renderPassInfo.framebuffer = renderer.swapChain.framebuffers[imageIndex];
     renderPassInfo.renderArea.offset = {0, 0};
     renderPassInfo.renderArea.extent = renderer.swapChain.extent;
-      // Set clear color to dark gray (RGBA in normalized floats: 0.2, 0.2, 0.2, 1.0)
-    VkClearValue clearColor = {{{0.2f, 0.2f, 0.2f, 1.0f}}};
+    
+    // Set clear color to dark gray (RGBA in normalized floats: 0.2, 0.2, 0.2, 1.0)
+    VkClearValue clearColor{};
+    clearColor.color = {0.2f, 0.2f, 0.2f, 1.0f};
+    
     renderPassInfo.clearValueCount = 1;
     renderPassInfo.pClearValues = &clearColor;
     
-    // Begin render pass
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
     
-    // For now, we'll just clear the screen and not draw anything
-    // In the future, bind pipeline, draw mesh, etc:
-    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline.graphicsPipeline);
-    // VkBuffer vertexBuffers[] = {meshToDraw.vertexBuffer};
-    // VkDeviceSize offsets[] = {0};
-    // vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-    // vkCmdDraw(commandBuffer, meshToDraw.vertexCount, 1, 0, 0);
+    // If we have a valid pipeline and mesh, draw it
+    if (activePipeline.graphicsPipeline != VK_NULL_HANDLE && meshToDraw.vertexCount > 0) {
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline.graphicsPipeline);
+        
+        VkBuffer vertexBuffers[] = {meshToDraw.vertexBuffer};
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+        
+        vkCmdDraw(commandBuffer, meshToDraw.vertexCount, 1, 0, 0);
+    }
     
-    // End render pass
     vkCmdEndRenderPass(commandBuffer);
     
     // End command buffer recording
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
         spdlog::critical("Failed to record command buffer");
-    }
-    renderPassInfo.renderArea.offset = { 0, 0 };
-    renderPassInfo.renderArea.extent = renderer.swapChain.extent;
-
-    // Clear values for color and depth (if used)
-    VkClearValue clearColor = { {0.0f, 0.0f, 0.0f, 1.0f} };
-    VkClearValue clearDepth = { 1.0f, 0 };
-    VkClearValue clearValues[] = { clearColor, clearDepth };
-
-    renderPassInfo.clearValueCount = 2;
-    renderPassInfo.pClearValues = clearValues;
-
-    // Begin the render pass
-    vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
-
-    // Bind the graphics pipeline
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline.graphicsPipeline);
-
-    // Bind the vertex buffer
-    VkBuffer vertexBuffers[] = { meshToDraw.vertexBuffer };
-    VkDeviceSize offsets[] = { 0 };
-    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-
-    // Draw the mesh
-    vkCmdDraw(commandBuffer, meshToDraw.vertexCount, 1, 0, 0);
-
-    // End the render pass
-    vkCmdEndRenderPass(commandBuffer);
-
-    // End command buffer recording
-    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
-        spdlog::critical("Failed to end recording command buffer");
         return;
     }
 
